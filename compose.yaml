@@ -1,0 +1,7 @@
+services:
+  inventory-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./persistent:/app/data
