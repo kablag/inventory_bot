@@ -80,18 +80,37 @@ display_date <- function(x) {
 ocr_photo <- function(file) {
   encoded <- base64enc::base64encode(readBin(file, what='raw', n=file.info(file)$size), linewidth=0)
   prompt <- paste(
-    'Распознай весь видимый текст на фото медицинского набора. Верни только JSON без markdown.',
-    'Формат: {"full_text":"весь текст с сохранением строк", "items":[{"product":"...","name":"сокращенное название", "dbsnp_id":"ID по dbSNP", "gene":"ген", "rsid":"rs... или пусто", "lot":"серия или пусто", "expiry":"ДД.ММ.ГГГГ или пусто", "dyes":"...", "storage":"...", "additional":{}}]}.',
-    'Не додумывай отсутствующие значения. Если дата неразборчива, expiry оставь пустым. Если видно несколько идентификаторов или наборов, перечисли каждый отдельно.',
+    'Распознай надписи именно на приложенном изображении этикетки. Не повторяй текст этой инструкции и не используй примеры или шаблонные значения.',
+    'Верни полный фактически прочитанный текст в full_text. В items помести массив объектов: по одному объекту для каждого набора/этикетки, видимого на фото.',
+    'У каждого объекта должны быть строковые поля product, name, dbsnp_id, gene, rsid, lot, expiry, dyes, storage и объект additional для прочих реально прочитанных полей.',
+    'В каждом поле укажи только прочитанное с изображения; неизвестное поле оставь пустой строкой, additional оставь пустым объектом. Не пиши многоточия и описания вроде "название" или "ген" как значения.',
+    'Сохраняй символы и цифры rsID точно. expiry заполняй только если дата однозначно читается; запиши ее как ДД.ММ.ГГГГ. Если дата дана только слитными цифрами или год/порядок частей неясен, оставь expiry пустым.',
+    'Не угадывай и не исправляй нечитаемые символы. Даже если часть данных не читается, все равно верни распознанный full_text и массив items.',
     sep='\n')
+  schema <- list(type='object', properties=list(
+    full_text=list(type='string'),
+    items=list(type='array', items=list(type='object', properties=list(
+      product=list(type='string'), name=list(type='string'), dbsnp_id=list(type='string'),
+      gene=list(type='string'), rsid=list(type='string'), lot=list(type='string'),
+      expiry=list(type='string'), dyes=list(type='string'), storage=list(type='string'),
+      additional=list(type='object')),
+      required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','dyes','storage','additional'),
+      additionalProperties=FALSE))),
+    required=list('full_text','items'), additionalProperties=FALSE)
   req <- request(paste0(OLLAMA_URL, '/api/generate')) |>
-    req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=list(encoded), stream=FALSE, format='json', options=list(temperature=0)), auto_unbox=TRUE) |>
+    req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=list(encoded), stream=FALSE,
+      format=schema, keep_alive=0, options=list(temperature=0)), auto_unbox=TRUE) |>
     req_timeout(300) |> req_perform()
   response <- resp_body_json(req, simplifyVector=FALSE)
   if (is.null(response$response)) stop('Ollama вернул пустой ответ')
   parsed <- tryCatch(fromJSON(response$response, simplifyVector=FALSE), error=function(e) NULL)
   if (is.null(parsed)) stop('Ollama вернул некорректный JSON')
-  list(text=as.character(parsed$full_text %||% ''), items=parsed$items %||% list(), raw=response$response)
+  full_text <- as.character(parsed$full_text %||% '')
+  items <- parsed$items %||% list()
+  if (!is.list(items) || grepl('весь текст с сохранением строк', full_text, ignore.case=TRUE) ||
+      grepl('...', response$response, fixed=TRUE))
+    stop('Модель вернула шаблон вместо распознанных данных')
+  list(text=full_text, items=items, raw=response$response)
 }
 valid_chat <- function(x) identical(as.character(x), TG_CHAT)
 make_rid <- function(chat,msg) paste0('tg_', chat, '_', msg)
