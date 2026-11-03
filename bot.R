@@ -2,7 +2,10 @@ suppressPackageStartupMessages({
   library(httr2); library(jsonlite); library(DBI); library(RSQLite); library(base64enc)
 })
 need <- function(key) { v <- Sys.getenv(key); if (!nzchar(v)) stop('Missing env: ', key); v }
-TG_TOKEN <- need('TELEGRAM_BOT_TOKEN'); TG_CHAT <- need('TELEGRAM_CHAT_ID')
+TG_TOKEN <- need('TELEGRAM_BOT_TOKEN')
+TG_CHATS <- unique(trimws(strsplit(need('TELEGRAM_CHAT_ID'), ',', fixed=TRUE)[[1]]))
+if (!length(TG_CHATS) || any(!grepl('^-?[0-9]+$', TG_CHATS)))
+  stop('TELEGRAM_CHAT_ID must be a comma-separated list of numeric chat IDs')
 SHEETS_URL <- need('APPS_SCRIPT_URL'); SHEETS_KEY <- need('INVENTORY_API_KEY')
 DRY_RUN <- tolower(Sys.getenv('DRY_RUN', 'true')) == 'true'
 TELEGRAM_PROXY <- Sys.getenv('TELEGRAM_PROXY', '')
@@ -112,7 +115,7 @@ ocr_photo <- function(file) {
     stop('Модель вернула шаблон вместо распознанных данных')
   list(text=full_text, items=items, raw=response$response)
 }
-valid_chat <- function(x) identical(as.character(x), TG_CHAT)
+valid_chat <- function(x) as.character(x) %in% TG_CHATS
 make_rid <- function(chat,msg) paste0('tg_', chat, '_', msg)
 parse_manual_pair <- function(x) {
   m <- regexec('^\\s*(rs[0-9]{4,12})\\s+([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{4})\\s*$', tolower(x %||% ''), perl=TRUE)
