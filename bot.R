@@ -109,8 +109,8 @@ ocr_photo <- function(file) {
   locator <- tryCatch({
     r <- request(paste0(OLLAMA_URL,'/api/generate')) |>
       req_body_json(list(model=OLLAMA_MODEL,prompt=locator_prompt,images=list(encoded),stream=FALSE,
-        format=locator_schema,keep_alive='30s',options=list(temperature=0)),auto_unbox=TRUE) |>
-      req_timeout(300) |> req_perform()
+        format=locator_schema,think=FALSE,keep_alive='2m',options=list(temperature=0,num_predict=128)),auto_unbox=TRUE) |>
+      req_timeout(30) |> req_perform()
     outer <- resp_body_json(r,simplifyVector=FALSE)
     fromJSON(outer$response,simplifyVector=FALSE)
   },error=function(e) NULL)
@@ -132,10 +132,10 @@ ocr_photo <- function(file) {
     left <- floor(b[1]*width); top <- floor(b[2]*height)
     cw <- max(1L,floor((b[3]-b[1])*width)); ch <- max(1L,floor((b[4]-b[2])*height))
     patch <- magick::image_crop(image,magick::geometry_area(cw,ch,left,top))
-    encode_image(magick::image_resize(patch,'1800x'))
+    encode_image(magick::image_resize(patch,'1200x'))
   })
   prompt <- paste(
-    'Изображение 1 — полное фото. Следующие изображения — найденные на нем целые этикетки крупным планом либо перекрывающиеся области всего кадра, если прямоугольники этикеток найти не удалось. Используй увеличенные изображения для считывания мелких полей. Не дублируй этикетки, попавшие в перекрывающиеся области.',
+    'Переданы увеличенные области одной фотографии: целые найденные этикетки либо перекрывающиеся полосы всего кадра. Собери строки одной этикетки вместе, не дублируй ее в перекрывающихся фрагментах.',
     'Верни в full_text весь фактически видимый текст этикетки, включая мелкую нижнюю часть. Сохрани подписи и порядок строк: значение относится только к подписи в той же строке. В items помести массив объектов: по одному объекту для каждого набора/этикетки на фото.',
     'Строго сопоставляй подпись и значение в одной строке: Красители → dyes; Серия → lot; Годен до → expiry; Хранить при → storage. Не сдвигай значения между соседними строками: температура хранения никогда не является сроком годности, а дата серии не является сроком годности.',
     'product — название набора/реагента из верхней части этикетки, например Синтол NP-471-100; name — краткое название, если оно напечатано. Не записывай красители в product.',
@@ -154,11 +154,11 @@ ocr_photo <- function(file) {
       required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','dyes','storage','additional'),
       additionalProperties=FALSE))),
     required=list('full_text','items'), additionalProperties=FALSE)
-  images <- c(list(encoded),focus_encoded)
+  images <- focus_encoded
   req <- request(paste0(OLLAMA_URL, '/api/generate')) |>
     req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=images, stream=FALSE,
-      format=schema, keep_alive=0, options=list(temperature=0)), auto_unbox=TRUE) |>
-    req_timeout(300) |> req_perform()
+      format=schema, think=FALSE, keep_alive=0, options=list(temperature=0,num_predict=900)), auto_unbox=TRUE) |>
+    req_timeout(90) |> req_perform()
   response <- resp_body_json(req, simplifyVector=FALSE)
   if (is.null(response$response)) stop('Ollama вернул пустой ответ')
   parsed <- tryCatch(fromJSON(response$response, simplifyVector=FALSE), error=function(e) NULL)
