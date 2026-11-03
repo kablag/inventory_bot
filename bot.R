@@ -1,5 +1,5 @@
 suppressPackageStartupMessages({
-  library(httr2); library(jsonlite); library(DBI); library(RSQLite); library(base64enc)
+  library(httr2); library(jsonlite); library(DBI); library(RSQLite); library(base64enc); library(magick)
 })
 need <- function(key) { v <- Sys.getenv(key); if (!nzchar(v)) stop('Missing env: ', key); v }
 TG_TOKEN <- need('TELEGRAM_BOT_TOKEN')
@@ -90,8 +90,52 @@ display_date <- function(x) {
 }
 ocr_photo <- function(file) {
   encoded <- base64enc::base64encode(readBin(file, what='raw', n=file.info(file)$size), linewidth=0)
+  # Locate whole labels from image content, then crop and enlarge each one.
+  image <- magick::image_read(file)
+  info <- magick::image_info(image)[1,]
+  width <- info$width; height <- info$height
+  encode_image <- function(im) {
+    path <- tempfile(fileext='.jpg'); on.exit(unlink(path),add=TRUE)
+    magick::image_write(im,path=path,format='jpeg',quality=95)
+    base64enc::base64encode(readBin(path,what='raw',n=file.info(path)$size),linewidth=0)
+  }
+  locator_prompt <- paste(
+    'Найди целые прямоугольные печатные этикетки наборов реагентов на фото.',
+    'Верни границы каждой этикетки целиком, от верхнего до нижнего края, включая мелкие строки. Координаты x0,y0,x1,y1 укажи в диапазоне 0..1000 относительно ширины и высоты изображения.',
+    'Не выделяй отдельные слова или фон. Если границы этикеток определить нельзя, верни пустой labels.',sep='\n')
+  locator_schema <- list(type='object',properties=list(labels=list(type='array',items=list(
+    type='object',properties=list(x0=list(type='number'),y0=list(type='number'),x1=list(type='number'),y1=list(type='number')),
+    required=list('x0','y0','x1','y1'),additionalProperties=FALSE))),required=list('labels'),additionalProperties=FALSE)
+  locator <- tryCatch({
+    r <- request(paste0(OLLAMA_URL,'/api/generate')) |>
+      req_body_json(list(model=OLLAMA_MODEL,prompt=locator_prompt,images=list(encoded),stream=FALSE,
+        format=locator_schema,keep_alive='30s',options=list(temperature=0)),auto_unbox=TRUE) |>
+      req_timeout(300) |> req_perform()
+    outer <- resp_body_json(r,simplifyVector=FALSE)
+    fromJSON(outer$response,simplifyVector=FALSE)
+  },error=function(e) NULL)
+  boxes <- list()
+  if (!is.null(locator) && is.list(locator$labels)) for (b in locator$labels) {
+    xy <- suppressWarnings(as.numeric(unlist(b[c('x0','y0','x1','y1')],use.names=FALSE)))
+    if (length(xy)!=4L || any(!is.finite(xy)) || any(xy<0) || any(xy>1000)) next
+    b <- xy/1000
+    if (b[3]<=b[1] || b[4]<=b[2]) next
+    mx <- (b[3]-b[1])*.10; my <- (b[4]-b[2])*.10
+    b[c(1,2)] <- pmax(0,b[c(1,2)]-c(mx,my)); b[c(3,4)] <- pmin(1,b[c(3,4)]+c(mx,my))
+    if ((b[3]-b[1])<.15 || (b[4]-b[2])<.07 || (b[3]-b[1])/(b[4]-b[2])<.35 || (b[3]-b[1])/(b[4]-b[2])>8) next
+    boxes[[length(boxes)+1L]] <- b
+    if (length(boxes)>=4L) break
+  }
+  # If localization fails, scan overlapping bands across the complete image.
+  if (!length(boxes)) boxes <- lapply(c(0,.15,.30),function(y) c(0,y,1,min(1,y+.70)))
+  focus_encoded <- lapply(boxes,function(b) {
+    left <- floor(b[1]*width); top <- floor(b[2]*height)
+    cw <- max(1L,floor((b[3]-b[1])*width)); ch <- max(1L,floor((b[4]-b[2])*height))
+    patch <- magick::image_crop(image,magick::geometry_area(cw,ch,left,top))
+    encode_image(magick::image_resize(patch,'1800x'))
+  })
   prompt <- paste(
-    'Распознай надписи именно на приложенном изображении этикетки. Не повторяй текст этой инструкции и не используй примеры или шаблонные значения.',
+    'Изображение 1 — полное фото. Следующие изображения — найденные на нем целые этикетки крупным планом либо перекрывающиеся области всего кадра, если прямоугольники этикеток найти не удалось. Используй увеличенные изображения для считывания мелких полей. Не дублируй этикетки, попавшие в перекрывающиеся области.',
     'Верни в full_text весь фактически видимый текст этикетки, включая мелкую нижнюю часть. Сохрани подписи и порядок строк: значение относится только к подписи в той же строке. В items помести массив объектов: по одному объекту для каждого набора/этикетки на фото.',
     'Строго сопоставляй подпись и значение в одной строке: Красители → dyes; Серия → lot; Годен до → expiry; Хранить при → storage. Не сдвигай значения между соседними строками: температура хранения никогда не является сроком годности, а дата серии не является сроком годности.',
     'product — название набора/реагента из верхней части этикетки, например Синтол NP-471-100; name — краткое название, если оно напечатано. Не записывай красители в product.',
@@ -110,8 +154,9 @@ ocr_photo <- function(file) {
       required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','dyes','storage','additional'),
       additionalProperties=FALSE))),
     required=list('full_text','items'), additionalProperties=FALSE)
+  images <- c(list(encoded),focus_encoded)
   req <- request(paste0(OLLAMA_URL, '/api/generate')) |>
-    req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=list(encoded), stream=FALSE,
+    req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=images, stream=FALSE,
       format=schema, keep_alive=0, options=list(temperature=0)), auto_unbox=TRUE) |>
     req_timeout(300) |> req_perform()
   response <- resp_body_json(req, simplifyVector=FALSE)
