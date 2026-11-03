@@ -65,10 +65,18 @@ get_photo <- function(file_id) {
 }
 normalize_rs <- function(x) {
   x <- tolower(gsub('[[:space:]]', '', as.character(x %||% '')))
+  if (grepl('^[0-9]{4,12}$', x)) x <- paste0('rs',x)
   if (grepl('^rs[0-9]{4,12}$', x)) x else ''
 }
 normalize_date <- function(x) {
   x <- trimws(as.character(x %||% ''))
+  # This label family prints expiry as DDMMYY (for example 180825 = 18.08.2025).
+  if (grepl('^[0-9]{6}$', x)) {
+    compact <- paste0('20',substr(x,5,6),'-',substr(x,3,4),'-',substr(x,1,2))
+    d <- suppressWarnings(as.Date(compact, format='%Y-%m-%d'))
+    if (!is.na(d) && format(d,'%Y-%m-%d') == compact) return(compact)
+    return('')
+  }
   fmts <- c('%d.%m.%Y','%d/%m/%Y','%d-%m-%Y','%Y-%m-%d')
   for (fmt in fmts) {
     d <- suppressWarnings(as.Date(x, format=fmt))
@@ -84,10 +92,11 @@ ocr_photo <- function(file) {
   encoded <- base64enc::base64encode(readBin(file, what='raw', n=file.info(file)$size), linewidth=0)
   prompt <- paste(
     'Распознай надписи именно на приложенном изображении этикетки. Не повторяй текст этой инструкции и не используй примеры или шаблонные значения.',
-    'Верни полный фактически прочитанный текст в full_text. В items помести массив объектов: по одному объекту для каждого набора/этикетки, видимого на фото.',
-    'У каждого объекта должны быть строковые поля product, name, dbsnp_id, gene, rsid, lot, expiry, dyes, storage и объект additional для прочих реально прочитанных полей.',
+    'Верни в full_text весь фактически видимый текст этикетки, включая мелкую нижнюю часть с красителями, серией, сроком годности и хранением. В items помести массив объектов: по одному объекту для каждого набора/этикетки на фото.',
+    'Заполняй поля по подписям этикетки: product — название набора/реагента, dyes — значение после Красители, lot — после Серия, expiry — после Годен до, storage — после Хранить при. Не записывай красители в product.',
+    'У каждого объекта должны быть строковые поля product, name, dbsnp_id, gene, rsid, lot, expiry, dyes, storage и объект additional для прочих реально прочитанных полей. В rsid включай префикс rs, если он есть на этикетке.',
     'В каждом поле укажи только прочитанное с изображения; неизвестное поле оставь пустой строкой, additional оставь пустым объектом. Не пиши многоточия и описания вроде "название" или "ген" как значения.',
-    'Сохраняй символы и цифры rsID точно. expiry заполняй только если дата однозначно читается; запиши ее как ДД.ММ.ГГГГ. Если дата дана только слитными цифрами или год/порядок частей неясен, оставь expiry пустым.',
+    'Сохраняй символы и цифры rsID точно. expiry заполняй, только если дата рядом с подписью Годен до читается однозначно. Формат ДД.ММ.ГГГГ оставляй так; шесть цифр без разделителей трактуй как ДДММГГ и преобразуй в ДД.ММ.20ГГ, только если это реальная календарная дата. При любой неоднозначности оставь expiry пустым.',
     'Не угадывай и не исправляй нечитаемые символы. Даже если часть данных не читается, все равно верни распознанный full_text и массив items.',
     sep='\n')
   schema <- list(type='object', properties=list(
@@ -238,7 +247,8 @@ on_callback <- function(cb) {
   say(p$chat,sprintf('✅ Списано: %s, годен до %s. Партия %d → %d; всего по rsID %d → %d шт.',
     p$rs,display_date(p$expiry),result$before,result$after,result$total_before,result$total_after))
 }
-cat('Starting Telegram polling; Ollama model=',OLLAMA_MODEL,' DRY_RUN=',DRY_RUN,'\n',sep='')
+cat('Starting Telegram polling; allowed chats=',paste(TG_CHATS,collapse=','),
+    '; Ollama model=',OLLAMA_MODEL,' DRY_RUN=',DRY_RUN,'\n',sep='')
 offset <- 0
 repeat {
   tryCatch({
