@@ -59,12 +59,15 @@ apps <- function(payload) {
   x
 }
 match_dates_in_sheet <- function(rs, dates) {
-  result <- tryCatch(apps(list(action='match_dates',rs=rs,dates=dates)),error=function(e)e)
+  # Send DMY strings to remain compatible with older deployed Apps Script
+  # versions that only accepted the spreadsheet's displayed date format.
+  sheet_dates <- vapply(dates,display_date,character(1))
+  result <- tryCatch(apps(list(action='match_dates',rs=rs,dates=sheet_dates)),error=function(e)e)
   if (!inherits(result,'error')) return(result)
   # Older deployed Apps Script versions do not yet have match_dates.
   if (!grepl('invalid_action',conditionMessage(result),fixed=TRUE)) stop(conditionMessage(result))
   matches <- lapply(unique(dates),function(expiry) {
-    found <- tryCatch(apps(list(action='lookup',rs=rs,expiry=expiry)),error=function(e)e)
+    found <- tryCatch(apps(list(action='lookup',rs=rs,expiry=display_date(expiry))),error=function(e)e)
     if (!inherits(found,'error')) return(list(expiry=expiry,count=1L))
     count <- if (grepl('ambiguous_lot',conditionMessage(found),fixed=TRUE)) 2L else 0L
     list(expiry=expiry,count=count)
@@ -203,7 +206,7 @@ queue_debit <- function(chat, photo_msg, user_id, rs, expiry) {
     show_manual_prompt(chat,photo_msg,user_id,'Не удалось однозначно распознать rsID или дату годности. Списания нет.')
     return(FALSE)
   }
-  found <- tryCatch(apps(list(action='lookup',rs=rs,expiry=expiry)),error=function(e)e)
+  found <- tryCatch(apps(list(action='lookup',rs=rs,expiry=display_date(expiry))),error=function(e)e)
   if (inherits(found,'error')) {
     say(chat,paste('Не удалось найти однозначную партию',rs,display_date(expiry),':',conditionMessage(found)))
     return(FALSE)
@@ -335,7 +338,7 @@ on_callback <- function(cb) {
   }
   tg('answerCallbackQuery',list(callback_query_id=cb$id,text='Повторно проверяю партию…'))
   if (DRY_RUN) {
-    check <- tryCatch(apps(list(action='lookup',rs=p$rs,expiry=p$expiry)),error=function(e)e)
+    check <- tryCatch(apps(list(action='lookup',rs=p$rs,expiry=display_date(p$expiry))),error=function(e)e)
     if (inherits(check,'error') || as.integer(check$stock)!=as.integer(p$stock)) {
       dbExecute(db,"UPDATE pending SET state='stale' WHERE rid=?",params=list(p$rid))
       say(p$chat,'Остаток партии изменился после появления кнопки. Заявка устарела; списания нет.'); return()
@@ -343,7 +346,7 @@ on_callback <- function(cb) {
     dbExecute(db,"UPDATE pending SET state='dry_run' WHERE rid=?",params=list(p$rid))
     say(p$chat,sprintf('ТЕСТ: %s, годен до %s, партия %d → %d. Google Sheets не изменена.',p$rs,display_date(p$expiry),p$stock,p$stock-1L)); return()
   }
-  result <- tryCatch(apps(list(action='commit',request_id=p$rid,rs=p$rs,expiry=p$expiry,
+  result <- tryCatch(apps(list(action='commit',request_id=p$rid,rs=p$rs,expiry=display_date(p$expiry),
     expected_stock=as.integer(p$stock),chat_id=p$chat,message_id=p$msg,user_id=p$user)),error=function(e)e)
   if (inherits(result,'error')) { say(p$chat,paste('Не удалось подтвердить списание. Проверьте журнал Google Sheets:',conditionMessage(result))); return() }
   if (!isTRUE(result$ok)) {
