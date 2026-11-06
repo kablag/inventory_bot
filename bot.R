@@ -127,8 +127,21 @@ ocr_photo <- function(file) {
     req_timeout(90) |> req_perform()
   response <- resp_body_json(req, simplifyVector=FALSE)
   if (is.null(response$response)) stop('Ollama вернул пустой ответ')
-  parsed <- tryCatch(fromJSON(response$response, simplifyVector=FALSE), error=function(e) NULL)
-  if (is.null(parsed)) stop('Ollama вернул некорректный JSON')
+  raw_response <- as.character(response$response)
+  # Some Ollama builds prepend thinking markers or wrap constrained JSON in
+  # markdown despite format=schema. Parse the full output first, then its JSON object.
+  json_candidates <- raw_response
+  json_start <- regexpr('\\{', raw_response)[1]
+  json_ends <- gregexpr('\\}', raw_response)[[1]]
+  json_end <- if (length(json_ends) && json_ends[1] > 0L) max(json_ends) else -1L
+  if (json_start > 0L && json_end >= json_start)
+    json_candidates <- c(json_candidates, substr(raw_response, json_start, json_end))
+  parsed <- NULL
+  for (candidate in unique(json_candidates)) {
+    parsed <- tryCatch(fromJSON(candidate, simplifyVector=FALSE), error=function(e) NULL)
+    if (is.list(parsed)) break
+  }
+  if (is.null(parsed)) stop('Ollama вернул некорректный JSON (ответ не удалось разобрать)')
   full_text <- as.character(parsed$full_text %||% '')
   items <- parsed$items %||% list()
   if (!is.list(items) || grepl('весь текст с сохранением строк', full_text, ignore.case=TRUE) ||
