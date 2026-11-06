@@ -58,6 +58,19 @@ apps <- function(payload) {
   if (!isTRUE(x$ok)) stop(x$error %||% 'unknown sheets error')
   x
 }
+match_dates_in_sheet <- function(rs, dates) {
+  result <- tryCatch(apps(list(action='match_dates',rs=rs,dates=dates)),error=function(e)e)
+  if (!inherits(result,'error')) return(result)
+  # Older deployed Apps Script versions do not yet have match_dates.
+  if (!grepl('invalid_action',conditionMessage(result),fixed=TRUE)) stop(conditionMessage(result))
+  matches <- lapply(unique(dates),function(expiry) {
+    found <- tryCatch(apps(list(action='lookup',rs=rs,expiry=expiry)),error=function(e)e)
+    if (!inherits(found,'error')) return(list(expiry=expiry,count=1L))
+    count <- if (grepl('ambiguous_lot',conditionMessage(found),fixed=TRUE)) 2L else 0L
+    list(expiry=expiry,count=count)
+  })
+  list(ok=TRUE,rs=rs,matches=matches)
+}
 get_photo <- function(file_id) {
   f <- tg('getFile', list(file_id=file_id))
   dest <- tempfile(fileext='.jpg')
@@ -116,7 +129,7 @@ ocr_photo <- function(file) {
       gene=list(type='string'), rsid=list(type='string'), lot=list(type='string'),
       expiry=list(type='string'), date_candidates=list(type='array',items=list(type='string')),
       dyes=list(type='string'), storage=list(type='string'),
-      additional=list(type='object')),
+      additional=list(type='object',additionalProperties=list(type='string'))),
       required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','date_candidates','dyes','storage','additional'),
       additionalProperties=FALSE))),
     required=list('full_text','items'), additionalProperties=FALSE)
@@ -149,6 +162,10 @@ ocr_photo <- function(file) {
     text_fallback <- gsub('<think>.*?</think>|</?think>', '', raw_response, perl=TRUE)
     text_fallback <- gsub('```[[:alnum:]]*|```', '', text_fallback)
     parsed <- list(full_text=trimws(text_fallback), items=list())
+  }
+  if (structured && !length(parsed$items %||% list()) && nzchar(parsed$full_text %||% '')) {
+    nested <- tryCatch(fromJSON(parsed$full_text, simplifyVector=FALSE),error=function(e)NULL)
+    if (is.list(nested) && is.list(nested$items) && length(nested$items)) parsed <- nested
   }
   full_text <- as.character(parsed$full_text %||% '')
   items <- parsed$items %||% list()
@@ -273,7 +290,7 @@ on_message <- function(msg) {
     show_manual_prompt(chat,msgid,as.character(msg$from$id),'Не удалось распознать дату Годен до.',rs)
     return()
   }
-  checked <- tryCatch(apps(list(action='match_dates',rs=rs,dates=date_values)),error=function(e)e)
+  checked <- tryCatch(match_dates_in_sheet(rs,date_values),error=function(e)e)
   if (inherits(checked,'error')) {
     show_manual_prompt(chat,msgid,as.character(msg$from$id),paste('Не удалось проверить распознанные даты в таблице:',conditionMessage(checked)),rs)
     return()
