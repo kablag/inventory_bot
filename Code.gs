@@ -28,9 +28,12 @@ function normalizeRs(value) {
 }
 function normalizeExpiry(value) {
   const s = String(value || '').trim();
-  const m = s.match(/^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})$/);
-  if (!m) return '';
-  const year = Number(m[3]), month = Number(m[2]), day = Number(m[1]);
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const dmy = s.match(/^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})$/);
+  if (!iso && !dmy) return '';
+  const year = Number(iso ? iso[1] : dmy[3]);
+  const month = Number(iso ? iso[2] : dmy[2]);
+  const day = Number(iso ? iso[3] : dmy[1]);
   const d = new Date(Date.UTC(year, month - 1, day));
   if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return '';
   return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
@@ -114,6 +117,13 @@ function execute(req) {
     const found = locate(req.rs, req.expiry);
     return {ok:true, status:'found', rs:found.rs, expiry:found.expiry, name:found.name,
       stock:found.stock, total:found.total, row:found.row};
+  }
+  if (req.action === 'match_dates') {
+    const rs = normalizeRs(req.rs);
+    if (!rs) throw new Error('invalid_rs');
+    const input = Array.isArray(req.dates) ? req.dates : [req.dates];
+    const dates = [...new Set(input.map(normalizeExpiry).filter(Boolean))];
+    return {ok:true, rs, matches:dates.map(expiry => ({expiry, count:lotRows(rs, expiry).length}))};
   }
   if (req.action === 'list_rs') {
     const sheet = getSheet(), last = sheet.getLastRow();

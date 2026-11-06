@@ -1,5 +1,5 @@
 suppressPackageStartupMessages({
-  library(httr2); library(jsonlite); library(DBI); library(RSQLite); library(base64enc); library(magick)
+  library(httr2); library(jsonlite); library(DBI); library(RSQLite); library(base64enc)
 })
 need <- function(key) { v <- Sys.getenv(key); if (!nzchar(v)) stop('Missing env: ', key); v }
 TG_TOKEN <- need('TELEGRAM_BOT_TOKEN')
@@ -25,7 +25,9 @@ pending_cols <- dbGetQuery(db, 'PRAGMA table_info(pending)')$name
 if (!'expiry' %in% pending_cols) dbExecute(db, "ALTER TABLE pending ADD COLUMN expiry TEXT NOT NULL DEFAULT ''")
 dbExecute(db, 'CREATE TABLE IF NOT EXISTS processed (chat TEXT, msg TEXT, PRIMARY KEY(chat,msg))')
 dbExecute(db, 'CREATE TABLE IF NOT EXISTS request_owners (rid TEXT PRIMARY KEY, user_id TEXT NOT NULL)')
-dbExecute(db, 'CREATE TABLE IF NOT EXISTS manual_requests (chat TEXT NOT NULL, prompt_msg TEXT NOT NULL, photo_msg TEXT NOT NULL, user_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(chat,prompt_msg))')
+dbExecute(db, "CREATE TABLE IF NOT EXISTS manual_requests (chat TEXT NOT NULL, prompt_msg TEXT NOT NULL, photo_msg TEXT NOT NULL, user_id TEXT NOT NULL, state TEXT NOT NULL, rs TEXT NOT NULL DEFAULT '', PRIMARY KEY(chat,prompt_msg))")
+manual_cols <- dbGetQuery(db, 'PRAGMA table_info(manual_requests)')$name
+if (!'rs' %in% manual_cols) dbExecute(db, "ALTER TABLE manual_requests ADD COLUMN rs TEXT NOT NULL DEFAULT ''")
 
 `%||%` <- function(a,b) if (is.null(a)) b else a
 tg <- function(method, data=list()) {
@@ -84,63 +86,26 @@ normalize_date <- function(x) {
   }
   ''
 }
+extract_date_tokens <- function(x) {
+  pattern <- '(?<![0-9])(?:[0-9]{6}|[0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})(?![0-9])'
+  hits <- regmatches(as.character(x %||% ''),gregexpr(pattern,as.character(x %||% ''),perl=TRUE))[[1]]
+  if (!length(hits)) return(character())
+  dates <- unique(vapply(hits,function(v) normalize_date(v),character(1)))
+  dates[nzchar(dates)]
+}
 display_date <- function(x) {
   d <- suppressWarnings(as.Date(x, '%Y-%m-%d'))
   if (is.na(d)) x else format(d, '%d.%m.%Y')
 }
 ocr_photo <- function(file) {
   encoded <- base64enc::base64encode(readBin(file, what='raw', n=file.info(file)$size), linewidth=0)
-  # Locate whole labels from image content, then crop and enlarge each one.
-  image <- magick::image_read(file)
-  info <- magick::image_info(image)[1,]
-  width <- info$width; height <- info$height
-  encode_image <- function(im) {
-    path <- tempfile(fileext='.jpg'); on.exit(unlink(path),add=TRUE)
-    magick::image_write(im,path=path,format='jpeg',quality=95)
-    base64enc::base64encode(readBin(path,what='raw',n=file.info(path)$size),linewidth=0)
-  }
-  locator_prompt <- paste(
-    'Найди целые прямоугольные печатные этикетки наборов реагентов на фото.',
-    'Верни границы каждой этикетки целиком, от верхнего до нижнего края, включая мелкие строки. Координаты x0,y0,x1,y1 укажи в диапазоне 0..1000 относительно ширины и высоты изображения.',
-    'Не выделяй отдельные слова или фон. Если границы этикеток определить нельзя, верни пустой labels.',sep='\n')
-  locator_schema <- list(type='object',properties=list(labels=list(type='array',items=list(
-    type='object',properties=list(x0=list(type='number'),y0=list(type='number'),x1=list(type='number'),y1=list(type='number')),
-    required=list('x0','y0','x1','y1'),additionalProperties=FALSE))),required=list('labels'),additionalProperties=FALSE)
-  locator <- tryCatch({
-    r <- request(paste0(OLLAMA_URL,'/api/generate')) |>
-      req_body_json(list(model=OLLAMA_MODEL,prompt=locator_prompt,images=list(encoded),stream=FALSE,
-        format=locator_schema,think=FALSE,keep_alive='2m',options=list(temperature=0,num_predict=128)),auto_unbox=TRUE) |>
-      req_timeout(30) |> req_perform()
-    outer <- resp_body_json(r,simplifyVector=FALSE)
-    fromJSON(outer$response,simplifyVector=FALSE)
-  },error=function(e) NULL)
-  boxes <- list()
-  if (!is.null(locator) && is.list(locator$labels)) for (b in locator$labels) {
-    xy <- suppressWarnings(as.numeric(unlist(b[c('x0','y0','x1','y1')],use.names=FALSE)))
-    if (length(xy)!=4L || any(!is.finite(xy)) || any(xy<0) || any(xy>1000)) next
-    b <- xy/1000
-    if (b[3]<=b[1] || b[4]<=b[2]) next
-    mx <- (b[3]-b[1])*.10; my <- (b[4]-b[2])*.10
-    b[c(1,2)] <- pmax(0,b[c(1,2)]-c(mx,my)); b[c(3,4)] <- pmin(1,b[c(3,4)]+c(mx,my))
-    if ((b[3]-b[1])<.15 || (b[4]-b[2])<.07 || (b[3]-b[1])/(b[4]-b[2])<.35 || (b[3]-b[1])/(b[4]-b[2])>8) next
-    boxes[[length(boxes)+1L]] <- b
-    if (length(boxes)>=4L) break
-  }
-  # If localization fails, scan overlapping bands across the complete image.
-  if (!length(boxes)) boxes <- lapply(c(0,.15,.30),function(y) c(0,y,1,min(1,y+.70)))
-  focus_encoded <- lapply(boxes,function(b) {
-    left <- floor(b[1]*width); top <- floor(b[2]*height)
-    cw <- max(1L,floor((b[3]-b[1])*width)); ch <- max(1L,floor((b[4]-b[2])*height))
-    patch <- magick::image_crop(image,magick::geometry_area(cw,ch,left,top))
-    encode_image(magick::image_resize(patch,'1200x'))
-  })
   prompt <- paste(
-    'Переданы увеличенные области одной фотографии: целые найденные этикетки либо перекрывающиеся полосы всего кадра. Собери строки одной этикетки вместе, не дублируй ее в перекрывающихся фрагментах.',
-    'Верни в full_text весь фактически видимый текст этикетки, включая мелкую нижнюю часть. Сохрани подписи и порядок строк: значение относится только к подписи в той же строке. В items помести массив объектов: по одному объекту для каждого набора/этикетки на фото.',
+    'Распознай исходную фотографию за один проход. Верни в full_text весь фактически видимый текст каждой этикетки, включая мелкую нижнюю часть и подписи полей. Сохрани порядок строк: значение относится только к подписи в той же строке.',
+    'В items помести массив объектов по одному на каждую этикетку. В date_candidates перечисли все распознанные значения, похожие на даты, независимо от подписи; не включай температуру или rsID.',
     'Строго сопоставляй подпись и значение в одной строке: Красители → dyes; Серия → lot; Годен до → expiry; Хранить при → storage. Не сдвигай значения между соседними строками: температура хранения никогда не является сроком годности, а дата серии не является сроком годности.',
     'product — название набора/реагента из верхней части этикетки, например Синтол NP-471-100; name — краткое название, если оно напечатано. Не записывай красители в product.',
-    'У каждого объекта должны быть строковые поля product, name, dbsnp_id, gene, rsid, lot, expiry, dyes, storage и объект additional для прочих реально прочитанных полей. В rsid включай префикс rs, если он есть на этикетке.',
-    'В каждом поле укажи только прочитанное с изображения; неизвестное поле оставь пустой строкой, additional оставь пустым объектом. Не пиши многоточия и описания вроде "название" или "ген" как значения.',
+    'У каждого объекта должны быть строковые поля product, name, dbsnp_id, gene, rsid, lot, expiry, dyes, storage, массив date_candidates и объект additional. В rsid включай префикс rs, если он есть на этикетке.',
+    'В каждом поле укажи только прочитанное с изображения; неизвестное строковое поле оставь пустой строкой, date_candidates — пустым массивом, additional — пустым объектом. Не пиши многоточия и описания вроде "название" или "ген" как значения.',
     'Сохраняй символы и цифры rsID точно. expiry заполняй, только если дата рядом с подписью Годен до читается однозначно. Формат ДД.ММ.ГГГГ оставляй так; шесть цифр без разделителей трактуй как ДДММГГ и преобразуй в ДД.ММ.20ГГ, только если это реальная календарная дата. При любой неоднозначности оставь expiry пустым.',
     'Не угадывай и не исправляй нечитаемые символы. Даже если часть данных не читается, все равно верни распознанный full_text и массив items.',
     sep='\n')
@@ -149,12 +114,13 @@ ocr_photo <- function(file) {
     items=list(type='array', items=list(type='object', properties=list(
       product=list(type='string'), name=list(type='string'), dbsnp_id=list(type='string'),
       gene=list(type='string'), rsid=list(type='string'), lot=list(type='string'),
-      expiry=list(type='string'), dyes=list(type='string'), storage=list(type='string'),
+      expiry=list(type='string'), date_candidates=list(type='array',items=list(type='string')),
+      dyes=list(type='string'), storage=list(type='string'),
       additional=list(type='object')),
-      required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','dyes','storage','additional'),
+      required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','date_candidates','dyes','storage','additional'),
       additionalProperties=FALSE))),
     required=list('full_text','items'), additionalProperties=FALSE)
-  images <- focus_encoded
+  images <- list(encoded)
   req <- request(paste0(OLLAMA_URL, '/api/generate')) |>
     req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=images, stream=FALSE,
       format=schema, think=FALSE, keep_alive=0, options=list(temperature=0,num_predict=900)), auto_unbox=TRUE) |>
@@ -179,10 +145,19 @@ parse_manual_pair <- function(x) {
   d <- normalize_date(z[3]); if (!nzchar(d)) return(NULL)
   list(rs=z[2], expiry=d)
 }
-show_manual_prompt <- function(chat, photo_msg, user_id, intro) {
-  prompt <- say(chat,paste0(intro, '\nОтветьте на это сообщение парой: rs1799853 05.05.2027. Автор фото должен подтвердить списание.'))
-  dbExecute(db, 'INSERT OR REPLACE INTO manual_requests (chat,prompt_msg,photo_msg,user_id,state) VALUES (?,?,?,?,?)',
-    params=list(chat,as.character(prompt$message_id),photo_msg,user_id,'waiting'))
+parse_manual_date <- function(x) {
+  d <- normalize_date(trimws(x %||% ''))
+  if (nzchar(d)) d else NULL
+}
+show_manual_prompt <- function(chat, photo_msg, user_id, intro, rs='') {
+  if (nzchar(rs)) {
+    text <- paste0(intro,'\nrsID уже определён: ',rs,'. Ответьте только сроком годности в формате ДД.ММ.ГГГГ. Списание будет предложено после проверки этой даты в таблице. Автор фото должен подтвердить списание.')
+  } else {
+    text <- paste0(intro,'\nОтветьте на это сообщение парой: rs1799853 05.05.2027. Автор фото должен подтвердить списание.')
+  }
+  prompt <- say(chat,text)
+  dbExecute(db, 'INSERT OR REPLACE INTO manual_requests (chat,prompt_msg,photo_msg,user_id,state,rs) VALUES (?,?,?,?,?,?)',
+    params=list(chat,as.character(prompt$message_id),photo_msg,user_id,'waiting',rs))
 }
 queue_debit <- function(chat, photo_msg, user_id, rs, expiry) {
   rs <- normalize_rs(rs); expiry <- normalize_date(expiry)
@@ -217,8 +192,14 @@ on_manual_reply <- function(msg, chat) {
   if (!nrow(candidate)) return(FALSE)
   req <- candidate[1,]; sender <- as.character(msg$from$id %||% '')
   if (!identical(sender,req$user_id)) { say(chat,'Уточнение пары rsID и даты может отправить только автор фото.'); return(TRUE) }
-  pair <- parse_manual_pair(msg$text %||% '')
-  if (is.null(pair)) { say(chat,'Введите в ответ на сообщение пару строго в формате: rs1799853 05.05.2027'); return(TRUE) }
+  if (nzchar(req$rs)) {
+    expiry <- parse_manual_date(msg$text %||% '')
+    if (is.null(expiry)) { say(chat,'Введите в ответ только дату Годен до в формате ДД.ММ.ГГГГ, например 05.05.2027'); return(TRUE) }
+    pair <- list(rs=req$rs,expiry=expiry)
+  } else {
+    pair <- parse_manual_pair(msg$text %||% '')
+    if (is.null(pair)) { say(chat,'Введите в ответ на сообщение пару строго в формате: rs1799853 05.05.2027'); return(TRUE) }
+  }
   dbExecute(db,"UPDATE manual_requests SET state='used' WHERE chat=? AND prompt_msg=? AND state='waiting'",params=list(chat,reply_id))
   queue_debit(chat,req$photo_msg,req$user_id,pair$rs,pair$expiry)
   TRUE
@@ -242,21 +223,60 @@ on_message <- function(msg) {
   pretty <- toJSON(list(full_text=ocr$text,items=ocr$items),auto_unbox=TRUE,pretty=TRUE,null='null')
   say(chat,paste0('Результат OCR (текст + JSON):\n',pretty))
   items <- ocr$items
-  pairs <- list()
   seen_rs <- character()
+  date_values <- extract_date_tokens(ocr$text)
+  direct_expiries <- character()
   for (item in items) {
     rs <- normalize_rs(item$rsid %||% '')
     if (nzchar(rs)) seen_rs <- unique(c(seen_rs,rs))
     expiry <- normalize_date(item$expiry %||% '')
-    if (nzchar(rs) && nzchar(expiry)) pairs[[paste(rs,expiry,sep='|')]] <- list(rs=rs,expiry=expiry)
+    if (nzchar(expiry)) direct_expiries <- unique(c(direct_expiries,expiry))
+    item_dates <- unlist(item$date_candidates %||% list(),use.names=FALSE)
+    item_dates <- c(item_dates,item$lot %||% '',item$expiry %||% '')
+    item_dates <- c(item_dates,extract_date_tokens(toJSON(item,auto_unbox=TRUE)))
+    for (raw_date in item_dates) {
+      d <- normalize_date(raw_date)
+      if (nzchar(d)) date_values <- unique(c(date_values,d))
+    }
   }
-  if (length(pairs)!=1L || length(seen_rs)!=1L) {
+  if (length(seen_rs)!=1L) {
     show_manual_prompt(chat,msgid,as.character(msg$from$id),
-      if (length(seen_rs)>1L || length(pairs)>1L) 'На фото найдено несколько rsID или пар rsID + срок годности; выбрать автоматически нельзя.' else 'Не удалось однозначно распознать пару rsID + срок годности.')
+      if (length(seen_rs)>1L) 'На фото найдено несколько rsID; выбрать автоматически нельзя.' else 'Не удалось распознать rsID.')
     return()
   }
-  pair <- pairs[[1]]
-  queue_debit(chat,msgid,as.character(msg$from$id),pair$rs,pair$expiry)
+  rs <- seen_rs[[1]]
+  if (!length(date_values)) {
+    show_manual_prompt(chat,msgid,as.character(msg$from$id),'Не удалось распознать дату Годен до.',rs)
+    return()
+  }
+  checked <- tryCatch(apps(list(action='match_dates',rs=rs,dates=date_values)),error=function(e)e)
+  if (inherits(checked,'error')) {
+    show_manual_prompt(chat,msgid,as.character(msg$from$id),paste('Не удалось проверить распознанные даты в таблице:',conditionMessage(checked)),rs)
+    return()
+  }
+  matches <- checked$matches %||% list()
+  matched_dates <- character(); unique_dates <- character()
+  for (m in matches) {
+    count <- suppressWarnings(as.integer(m$count %||% 0))
+    if (count>0L) matched_dates <- unique(c(matched_dates,as.character(m$expiry)))
+    if (count==1L) unique_dates <- unique(c(unique_dates,as.character(m$expiry)))
+  }
+  direct <- intersect(direct_expiries,unique_dates)
+  if (length(direct)==1L) {
+    queue_debit(chat,msgid,as.character(msg$from$id),rs,direct[[1]])
+    return()
+  }
+  if (length(unique_dates)==1L) {
+    queue_debit(chat,msgid,as.character(msg$from$id),rs,unique_dates[[1]])
+    return()
+  }
+  suggestions <- if (length(unique_dates)) unique_dates else matched_dates
+  if (length(suggestions)) {
+    note <- paste0('По rsID ',rs,' в таблице найдены эти даты из OCR: ',paste(vapply(suggestions,display_date,character(1)),collapse=', '),'. Укажите именно дату Годен до.')
+  } else {
+    note <- paste0('rsID ',rs,' распознан. Даты из OCR (',paste(vapply(date_values,display_date,character(1)),collapse=', '),') не совпали с датами партий в таблице. Укажите дату Годен до вручную.')
+  }
+  show_manual_prompt(chat,msgid,as.character(msg$from$id),note,rs)
 }
 on_callback <- function(cb) {
   info <- strsplit(cb$data %||% '',':',fixed=TRUE)[[1]]
