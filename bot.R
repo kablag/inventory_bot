@@ -141,11 +141,19 @@ ocr_photo <- function(file) {
     parsed <- tryCatch(fromJSON(candidate, simplifyVector=FALSE), error=function(e) NULL)
     if (is.list(parsed)) break
   }
-  if (is.null(parsed)) stop('Ollama вернул некорректный JSON (ответ не удалось разобрать)')
+  if (!is.list(parsed)) parsed <- NULL
+  structured <- !is.null(parsed)
+  if (is.null(parsed)) {
+    # Keep the single-pass OCR useful if the model ignores the JSON schema.
+    # The caller will still require an exact rsID/date match in the sheet.
+    text_fallback <- gsub('<think>.*?</think>|</?think>', '', raw_response, perl=TRUE)
+    text_fallback <- gsub('```[[:alnum:]]*|```', '', text_fallback)
+    parsed <- list(full_text=trimws(text_fallback), items=list())
+  }
   full_text <- as.character(parsed$full_text %||% '')
   items <- parsed$items %||% list()
-  if (!is.list(items) || grepl('весь текст с сохранением строк', full_text, ignore.case=TRUE) ||
-      grepl('...', response$response, fixed=TRUE))
+  if (!is.list(items) || (structured && (grepl('весь текст с сохранением строк', full_text, ignore.case=TRUE) ||
+      grepl('...', response$response, fixed=TRUE))))
     stop('Модель вернула шаблон вместо распознанных данных')
   list(text=full_text, items=items, raw=response$response)
 }
@@ -237,6 +245,9 @@ on_message <- function(msg) {
   say(chat,paste0('Результат OCR (текст + JSON):\n',pretty))
   items <- ocr$items
   seen_rs <- character()
+  rs_hits <- regmatches(ocr$text,gregexpr('(?i)rs[[:space:]]*[0-9]{4,12}',ocr$text,perl=TRUE))[[1]]
+  if (length(rs_hits)) seen_rs <- unique(vapply(rs_hits,normalize_rs,character(1)))
+  seen_rs <- seen_rs[nzchar(seen_rs)]
   date_values <- extract_date_tokens(ocr$text)
   direct_expiries <- character()
   for (item in items) {
