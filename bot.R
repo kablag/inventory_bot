@@ -114,68 +114,64 @@ display_date <- function(x) {
   if (is.na(d)) x else format(d, '%d.%m.%Y')
 }
 ocr_photo <- function(file) {
-  encoded <- base64enc::base64encode(readBin(file, what='raw', n=file.info(file)$size), linewidth=0)
+  encoded <- base64enc::base64encode(
+    readBin(file, what = "raw", n = file.info(file)$size),
+    linewidth = 0
+  )
+
   prompt <- paste(
-    'Распознай исходную фотографию за один проход. Верни в full_text весь фактически видимый текст каждой этикетки, включая мелкую нижнюю часть и подписи полей. Сохрани порядок строк: значение относится только к подписи в той же строке.',
-    'В items помести массив объектов по одному на каждую этикетку. В date_candidates перечисли все распознанные значения, похожие на даты, независимо от подписи; не включай температуру или rsID.',
-    'Строго сопоставляй подпись и значение в одной строке: Красители → dyes; Серия → lot; Годен до → expiry; Хранить при → storage. Не сдвигай значения между соседними строками: температура хранения никогда не является сроком годности, а дата серии не является сроком годности.',
-    'product — название набора/реагента из верхней части этикетки, например Синтол NP-471-100; name — краткое название, если оно напечатано. Не записывай красители в product.',
-    'У каждого объекта должны быть строковые поля product, name, dbsnp_id, gene, rsid, lot, expiry, dyes, storage, массив date_candidates и объект additional. В rsid включай префикс rs, если он есть на этикетке.',
-    'В каждом поле укажи только прочитанное с изображения; неизвестное строковое поле оставь пустой строкой, date_candidates — пустым массивом, additional — пустым объектом. Не пиши многоточия и описания вроде "название" или "ген" как значения.',
-    'Сохраняй символы и цифры rsID точно. expiry заполняй, только если дата рядом с подписью Годен до читается однозначно. Формат ДД.ММ.ГГГГ оставляй так; шесть цифр без разделителей трактуй как ДДММГГ и преобразуй в ДД.ММ.20ГГ, только если это реальная календарная дата. При любой неоднозначности оставь expiry пустым.',
-    'Не угадывай и не исправляй нечитаемые символы. Даже если часть данных не читается, все равно верни распознанный full_text и массив items.',
-    sep='\n')
-  schema <- list(type='object', properties=list(
-    full_text=list(type='string'),
-    items=list(type='array', items=list(type='object', properties=list(
-      product=list(type='string'), name=list(type='string'), dbsnp_id=list(type='string'),
-      gene=list(type='string'), rsid=list(type='string'), lot=list(type='string'),
-      expiry=list(type='string'), date_candidates=list(type='array',items=list(type='string')),
-      dyes=list(type='string'), storage=list(type='string'),
-      additional=list(type='object',additionalProperties=list(type='string'))),
-      required=list('product','name','dbsnp_id','gene','rsid','lot','expiry','date_candidates','dyes','storage','additional'),
-      additionalProperties=FALSE))),
-    required=list('full_text','items'), additionalProperties=FALSE)
-  images <- list(encoded)
-  req <- request(paste0(OLLAMA_URL, '/api/generate')) |>
-    req_body_json(list(model=OLLAMA_MODEL, prompt=prompt, images=images, stream=FALSE,
-      format=schema, think=FALSE, keep_alive=0, options=list(temperature=0,num_predict=900)), auto_unbox=TRUE) |>
-    req_timeout(90) |> req_perform()
-  response <- resp_body_json(req, simplifyVector=FALSE)
-  if (is.null(response$response)) stop('Ollama вернул пустой ответ')
-  raw_response <- as.character(response$response)
-  # Some Ollama builds prepend thinking markers or wrap constrained JSON in
-  # markdown despite format=schema. Parse the full output first, then its JSON object.
-  json_candidates <- raw_response
-  json_start <- regexpr('\\{', raw_response)[1]
-  json_ends <- gregexpr('\\}', raw_response)[[1]]
-  json_end <- if (length(json_ends) && json_ends[1] > 0L) max(json_ends) else -1L
-  if (json_start > 0L && json_end >= json_start)
-    json_candidates <- c(json_candidates, substr(raw_response, json_start, json_end))
-  parsed <- NULL
-  for (candidate in unique(json_candidates)) {
-    parsed <- tryCatch(fromJSON(candidate, simplifyVector=FALSE), error=function(e) NULL)
-    if (is.list(parsed)) break
+    "Transcribe all visible text in this image.",
+    "Preserve the original text, numbers, punctuation and line breaks.",
+    "Do not interpret, summarize or invent missing characters.",
+    "Output only the transcribed text."
+  )
+
+  req <- httr2::request(
+    paste0(OLLAMA_URL, "/api/generate")
+  ) |>
+    httr2::req_body_json(
+      list(
+        model = OLLAMA_MODEL,
+        prompt = prompt,
+        images = list(encoded),
+        stream = FALSE,
+        think = FALSE,
+        keep_alive = 0,
+        options = list(
+          temperature = 0,
+          num_ctx = 4096,
+          num_predict = 1200
+        )
+      ),
+      auto_unbox = TRUE
+    ) |>
+    httr2::req_timeout(240) |>
+    httr2::req_perform()
+
+  response <- httr2::resp_body_json(
+    req, simplifyVector = FALSE
+  )
+
+  raw_text <- as.character(response$response %||% "")
+
+  raw_text <- gsub(
+    "(?s)<think>.*?</think>|</?think>",
+    "",
+    raw_text,
+    perl = TRUE
+  )
+
+  raw_text <- trimws(raw_text)
+
+  if (!nzchar(raw_text)) {
+    stop("Ollama вернула пустой результат OCR")
   }
-  if (!is.list(parsed)) parsed <- NULL
-  structured <- !is.null(parsed)
-  if (is.null(parsed)) {
-    # Keep the single-pass OCR useful if the model ignores the JSON schema.
-    # The caller will still require an exact rsID/date match in the sheet.
-    text_fallback <- gsub('<think>.*?</think>|</?think>', '', raw_response, perl=TRUE)
-    text_fallback <- gsub('```[[:alnum:]]*|```', '', text_fallback)
-    parsed <- list(full_text=trimws(text_fallback), items=list())
-  }
-  if (structured && !length(parsed$items %||% list()) && nzchar(parsed$full_text %||% '')) {
-    nested <- tryCatch(fromJSON(parsed$full_text, simplifyVector=FALSE),error=function(e)NULL)
-    if (is.list(nested) && is.list(nested$items) && length(nested$items)) parsed <- nested
-  }
-  full_text <- as.character(parsed$full_text %||% '')
-  items <- parsed$items %||% list()
-  if (!is.list(items) || (structured && (grepl('весь текст с сохранением строк', full_text, ignore.case=TRUE) ||
-      grepl('...', response$response, fixed=TRUE))))
-    stop('Модель вернула шаблон вместо распознанных данных')
-  list(text=full_text, items=items, raw=response$response)
+
+  list(
+    text = raw_text,
+    items = list(),
+    raw = response$response
+  )
 }
 valid_chat <- function(x) as.character(x) %in% TG_CHATS
 make_rid <- function(chat,msg) paste0('tg_', chat, '_', msg)
