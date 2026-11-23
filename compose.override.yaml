@@ -1,0 +1,13 @@
+services:
+   rapidocr:
+    image: inventory-rapidocr:local
+    restart: unless-stopped
+    entrypoint:
+      - python
+      - /app/ocr_server.py
+    volumes:
+      - ./rapidocr/ocr_server.py:/app/ocr_server.py:ro
+    expose:
+      - "8080"
+    mem_limit: 1g
+    cpus: 2.0 
