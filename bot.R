@@ -152,6 +152,34 @@ ocr_photo <- function(file) {
     req, simplifyVector = FALSE
   )
 
+cat("\n=== OLLAMA OCR DEBUG ===\n")
+
+cat("Response fields:\n")
+print(names(response))
+
+cat("done_reason:",
+    response$done_reason %||% "NULL", "\n")
+
+cat("response length:",
+    nchar(response$response %||% ""), "\n")
+
+cat("thinking length:",
+    nchar(response$thinking %||% ""), "\n")
+
+cat("eval_count:",
+    response$eval_count %||% "NULL", "\n")
+
+cat("prompt_eval_count:",
+    response$prompt_eval_count %||% "NULL", "\n")
+
+cat("response text:\n")
+print(substr(response$response %||% "", 1, 2000))
+
+cat("thinking text:\n")
+print(substr(response$thinking %||% "", 1, 2000))
+
+cat("=== END DEBUG ===\n")
+  
   raw_text <- as.character(response$response %||% "")
 
   raw_text <- gsub(
