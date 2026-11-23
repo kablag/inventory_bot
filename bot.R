@@ -115,90 +115,40 @@ display_date <- function(x) {
 }
 ocr_photo <- function(file) {
   encoded <- base64enc::base64encode(
-    readBin(file, what = "raw", n = file.info(file)$size),
+    readBin(
+      file,
+      what = "raw",
+      n = file.info(file)$size
+    ),
     linewidth = 0
   )
 
-  prompt <- paste(
-    "Transcribe all visible text in this image.",
-    "Preserve the original text, numbers, punctuation and line breaks.",
-    "Do not interpret, summarize or invent missing characters.",
-    "Output only the transcribed text."
-  )
-
   req <- httr2::request(
-    paste0(OLLAMA_URL, "/api/generate")
+    "http://rapidocr:8080/ocr"
   ) |>
     httr2::req_body_json(
-      list(
-        model = OLLAMA_MODEL,
-        prompt = prompt,
-        images = list(encoded),
-        stream = FALSE,
-        think = FALSE,
-        keep_alive = 0,
-        options = list(
-          temperature = 0,
-          num_ctx = 4096,
-          num_predict = 1200
-        )
-      ),
+      list(image = encoded),
       auto_unbox = TRUE
     ) |>
-    httr2::req_timeout(240) |>
+    httr2::req_timeout(60) |>
     httr2::req_perform()
 
-  response <- httr2::resp_body_json(
-    req, simplifyVector = FALSE
+  result <- httr2::resp_body_json(
+    req,
+    simplifyVector = FALSE
   )
 
-cat("\n=== OLLAMA OCR DEBUG ===\n")
+  full_text <- result$full_text %||% ""
 
-cat("Response fields:\n")
-print(names(response))
-
-cat("done_reason:",
-    response$done_reason %||% "NULL", "\n")
-
-cat("response length:",
-    nchar(response$response %||% ""), "\n")
-
-cat("thinking length:",
-    nchar(response$thinking %||% ""), "\n")
-
-cat("eval_count:",
-    response$eval_count %||% "NULL", "\n")
-
-cat("prompt_eval_count:",
-    response$prompt_eval_count %||% "NULL", "\n")
-
-cat("response text:\n")
-print(substr(response$response %||% "", 1, 2000))
-
-cat("thinking text:\n")
-print(substr(response$thinking %||% "", 1, 2000))
-
-cat("=== END DEBUG ===\n")
-  
-  raw_text <- as.character(response$response %||% "")
-
-  raw_text <- gsub(
-    "(?s)<think>.*?</think>|</?think>",
-    "",
-    raw_text,
-    perl = TRUE
-  )
-
-  raw_text <- trimws(raw_text)
-
-  if (!nzchar(raw_text)) {
-    stop("Ollama вернула пустой результат OCR")
+  if (!nzchar(trimws(full_text))) {
+    stop("RapidOCR не обнаружил текста")
   }
 
   list(
-    text = raw_text,
+    text = full_text,
     items = list(),
-    raw = response$response
+    lines = result$lines,
+    raw = full_text
   )
 }
 valid_chat <- function(x) as.character(x) %in% TG_CHATS
